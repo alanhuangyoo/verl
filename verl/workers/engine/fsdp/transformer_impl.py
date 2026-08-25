@@ -679,8 +679,13 @@ class FSDPEngine(BaseEngine):
         reduces FSDP gradient collectives from one reduce-scatter per
         micro-batch to a single round, at the cost of temporarily retaining
         unsharded gradients until the final backward.
+
+        That cost is an unsharded gradient per parameter, and under the default
+        ``reduce_dtype=fp32`` against bf16 parameters FSDP2 upcasts it, so the peak
+        is 4 bytes per parameter on every rank and does not shrink with world size.
+        ``engine.defer_fsdp_grad_sync=False`` trades it back for the extra collectives.
         """
-        if is_last_micro_batch:
+        if is_last_micro_batch or not self.engine_config.defer_fsdp_grad_sync:
             yield
             return
 

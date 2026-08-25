@@ -45,6 +45,7 @@ actor_rollout_ref:
       entropy_checkpointing: ${oc.select:actor_rollout_ref.actor.entropy_checkpointing,False}
       pad_to_length: ${oc.select:actor_rollout_ref.actor.pad_to_length,False}
       pad_to_length_bucket: 1024
+      defer_fsdp_grad_sync: true
       forward_only: false
       strategy: fsdp
       dtype: bfloat16
@@ -250,6 +251,7 @@ actor_rollout_ref:
       entropy_checkpointing: ${oc.select:actor_rollout_ref.ref.entropy_checkpointing,False}
       pad_to_length: ${oc.select:actor_rollout_ref.ref.pad_to_length,False}
       pad_to_length_bucket: ${oc.select:actor_rollout_ref.actor.fsdp_config.pad_to_length_bucket,1024}
+      defer_fsdp_grad_sync: true
       forward_only: true
       strategy: fsdp
       dtype: bfloat16
@@ -567,6 +569,7 @@ critic:
     entropy_checkpointing: false
     pad_to_length: false
     pad_to_length_bucket: 1024
+    defer_fsdp_grad_sync: true
     forward_only: false
     strategy: fsdp
     dtype: bfloat16
@@ -957,7 +960,6 @@ trainer:
   esi_redundant_time: 0
   resume_mode: auto
   resume_from_path: null
-  checkpoint_callback_class: null
   val_before_train: true
   val_only: false
   test_freq: -1

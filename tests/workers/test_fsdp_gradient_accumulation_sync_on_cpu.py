@@ -21,8 +21,9 @@ import torch.multiprocessing as mp
 from tensordict import TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardingStrategy, fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy, ShardingStrategy, fully_shard
 
+from verl.workers.config.engine import FSDPEngineConfig
 from verl.workers.engine.fsdp import transformer_impl
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
@@ -48,9 +49,10 @@ class _FSDP2Module:
         self.events.append(enabled)
 
 
-def _make_engine(module):
+def _make_engine(module, defer_fsdp_grad_sync=True):
     engine = object.__new__(FSDPEngine)
     engine.module = module
+    engine.engine_config = FSDPEngineConfig(defer_fsdp_grad_sync=defer_fsdp_grad_sync)
     return engine
 
 
@@ -85,6 +87,21 @@ def test_gradient_sync_context_keeps_sync_for_final_micro_batch(monkeypatch):
     monkeypatch.setattr(transformer_impl, "fsdp_version", lambda _: 2)
 
     with engine._gradient_sync_context(is_last_micro_batch=True):
+        module.events.append("backward")
+
+    assert module.events == ["backward"]
+
+
+@pytest.mark.parametrize("version,module_cls", [(1, _FSDP1Module), (2, _FSDP2Module)])
+def test_gradient_sync_context_can_be_disabled(monkeypatch, version, module_cls):
+    # Deferring costs an unsharded gradient per parameter until the final backward, which is
+    # 4 bytes per parameter under the default fp32 reduce dtype and does not shrink with world
+    # size. Opting out trades that back for one reduce-scatter per micro-batch.
+    module = module_cls()
+    engine = _make_engine(module, defer_fsdp_grad_sync=False)
+    monkeypatch.setattr(transformer_impl, "fsdp_version", lambda _: version)
+
+    with engine._gradient_sync_context(is_last_micro_batch=False):
         module.events.append("backward")
 
     assert module.events == ["backward"]
@@ -215,6 +232,82 @@ def test_distributed_accumulation_matches_per_micro_batch_sync(tmp_path):
     rendezvous_file = str(tmp_path / "fsdp_rdzv")
     mp.spawn(
         _distributed_equivalence_worker,
+        args=(world_size, rendezvous_file),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+def _accumulated_grad_bytes(model):
+    """Bytes held in FSDP2's unsharded accumulated-gradient buffers, and their dtypes."""
+    total_bytes = 0
+    dtypes = set()
+    for module in model.modules():
+        get_state = getattr(module, "_get_fsdp_state", None)
+        if get_state is None:
+            continue
+        param_group = get_state()._fsdp_param_group
+        if param_group is None:
+            continue
+        for fsdp_param in param_group.fsdp_params:
+            grad = fsdp_param.unsharded_accumulated_grad
+            if grad is not None:
+                total_bytes += grad.numel() * grad.element_size()
+                dtypes.add(grad.dtype)
+    return total_bytes, dtypes
+
+
+def _deferred_grad_memory_worker(rank, world_size, rendezvous_file):
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{rendezvous_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world_size,))
+        hidden = 32
+        # The default policy: bf16 parameters reduced in fp32.
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
+        )
+        torch.manual_seed(2026)
+        model = torch.nn.Sequential(*[torch.nn.Linear(hidden, hidden, bias=False) for _ in range(2)])
+        num_parameters = sum(parameter.numel() for parameter in model.parameters())
+        for layer in model:
+            fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
+        fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+        inputs = torch.randn(4, hidden)
+
+        engine = _make_engine(model, defer_fsdp_grad_sync=False)
+        with engine._gradient_sync_context(is_last_micro_batch=False):
+            model(inputs).sum().backward()
+        assert _accumulated_grad_bytes(model)[0] == 0
+
+        engine = _make_engine(model, defer_fsdp_grad_sync=True)
+        with engine._gradient_sync_context(is_last_micro_batch=False):
+            model(inputs).sum().backward()
+        held_bytes, dtypes = _accumulated_grad_bytes(model)
+
+        # One unsharded fp32 gradient per parameter, on every rank: 4 bytes per parameter of the
+        # whole model, not of this rank's shard.
+        assert dtypes == {torch.float32}
+        assert held_bytes == num_parameters * 4
+
+        # The final micro-batch reduce-scatters them away.
+        with engine._gradient_sync_context(is_last_micro_batch=True):
+            model(inputs).sum().backward()
+        assert _accumulated_grad_bytes(model)[0] == 0
+    finally:
+        dist.destroy_process_group()
+
+
+def test_deferred_sync_holds_one_unsharded_fp32_grad_per_parameter(tmp_path):
+    world_size = 2
+    rendezvous_file = str(tmp_path / "fsdp_grad_mem_rdzv")
+    mp.spawn(
+        _deferred_grad_memory_worker,
         args=(world_size, rendezvous_file),
         nprocs=world_size,
         join=True,

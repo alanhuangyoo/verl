@@ -273,6 +273,13 @@ class FSDPEngineConfig(EngineConfig):
             (``max_token_len_per_gpu * ulysses_sequence_parallel_size``) collapses every
             within-budget micro-batch onto a single shape. Only read when ``pad_to_length=True``.
             default 1024
+        defer_fsdp_grad_sync (bool): Skip FSDP gradient communication on the non-final
+            micro-batches of a gradient-accumulation round, so the mini-batch costs one
+            reduce-scatter instead of one per micro-batch. FSDP then holds an *unsharded*
+            gradient per parameter until the final backward, and under the default
+            ``reduce_dtype=fp32`` against bf16 parameters it upcasts them, so the peak is
+            4 bytes per parameter on every rank and does not shrink with world size. Turn it
+            off to trade that memory back for the extra collectives. default True
         qat (QATEngineConfig): QAT configuration, default disabled
     """
 
@@ -296,6 +303,7 @@ class FSDPEngineConfig(EngineConfig):
     strategy: str = "fsdp"
     pad_to_length: bool = False
     pad_to_length_bucket: int = 1024
+    defer_fsdp_grad_sync: bool = True
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
     turbo_config: dict[str, Any] = field(default_factory=dict)
 
