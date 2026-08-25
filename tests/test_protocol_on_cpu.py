@@ -1229,6 +1229,59 @@ def test_numpy_dataproto_serialization_skips_tensordict_consolidation(monkeypatc
     assert restored.meta_info == {"step": 1}
 
 
+@pytest.mark.parametrize(
+    ("sender_method", "receiver_method"),
+    [("numpy", None), (None, "numpy")],
+)
+def test_dataproto_state_survives_a_serialization_method_mismatch(monkeypatch, sender_method, receiver_method):
+    """__getstate__ runs on the sender and __setstate__ on the receiver.
+
+    VERL_DATAPROTO_SERIALIZATION_METHOD is not part of the Ray runtime-env whitelist, so the two
+    processes do not always read the same value. The payload has to say which branch wrote it.
+    """
+    data = DataProto.from_dict(
+        tensors={"obs": torch.arange(12).reshape(3, 4)},
+        non_tensors={"labels": np.array(["a", "b", "c"], dtype=object)},
+        meta_info={"step": 1},
+    )
+
+    monkeypatch.delenv("VERL_DATAPROTO_SERIALIZATION_METHOD", raising=False)
+    if sender_method is not None:
+        monkeypatch.setenv("VERL_DATAPROTO_SERIALIZATION_METHOD", sender_method)
+    state = data.__getstate__()
+
+    monkeypatch.delenv("VERL_DATAPROTO_SERIALIZATION_METHOD", raising=False)
+    if receiver_method is not None:
+        monkeypatch.setenv("VERL_DATAPROTO_SERIALIZATION_METHOD", receiver_method)
+    restored = DataProto()
+    restored.__setstate__(state)
+
+    torch.testing.assert_close(restored.batch["obs"], data.batch["obs"])
+    assert restored.non_tensor_batch["labels"].tolist() == ["a", "b", "c"]
+    assert restored.meta_info == {"step": 1}
+
+
+def test_dataproto_state_without_a_batch_survives_a_mismatch(monkeypatch):
+    """NumPy serialization writes None for an absent batch, which is not a torch.save payload."""
+    data = DataProto.from_dict(
+        tensors={},
+        non_tensors={"labels": np.array(["a"], dtype=object)},
+        meta_info={"step": 1},
+    )
+    data.batch = None
+
+    monkeypatch.setenv("VERL_DATAPROTO_SERIALIZATION_METHOD", "numpy")
+    state = data.__getstate__()
+    assert state[0] is None
+
+    monkeypatch.delenv("VERL_DATAPROTO_SERIALIZATION_METHOD", raising=False)
+    restored = DataProto()
+    restored.__setstate__(state)
+
+    assert restored.batch is None
+    assert restored.non_tensor_batch["labels"].tolist() == ["a"]
+
+
 def test_serialize_dataproto_with_empty_tensordict():
     """Tests that serializing a DataProto with an empty TensorDict does not crash.
 

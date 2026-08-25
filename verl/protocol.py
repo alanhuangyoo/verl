@@ -399,23 +399,26 @@ class DataProto:
             return buffer_bytes, self.non_tensor_batch, self.meta_info
 
     def __setstate__(self, data):
-        batch_deserialized_bytes, non_tensor_batch, meta_info = data
+        serialized_batch, non_tensor_batch, meta_info = data
 
-        if os.getenv("VERL_DATAPROTO_SERIALIZATION_METHOD") == "numpy":
-            if batch_deserialized_bytes is not None:
-                self.batch = deserialize_tensordict(batch_deserialized_bytes)
-            else:
-                self.batch = None
-        else:
+        # Which branch produced the payload is read off the payload itself, not off this
+        # process's VERL_DATAPROTO_SERIALIZATION_METHOD. __getstate__ runs on the sender and
+        # __setstate__ on the receiver, and the variable is not part of the Ray runtime env
+        # whitelist, so the two do not always agree. ``torch.save`` writes bytes;
+        # ``serialize_tensordict`` returns a tuple, or None for an absent batch.
+        if isinstance(serialized_batch, bytes | bytearray):
             import io
 
-            batch_deserialized = io.BytesIO(initial_bytes=batch_deserialized_bytes)
-            batch = torch.load(
+            batch_deserialized = io.BytesIO(initial_bytes=serialized_batch)
+            self.batch = torch.load(
                 batch_deserialized,
                 weights_only=False,
                 map_location="cpu" if not get_torch_device().is_available() else None,
             )
-            self.batch = batch
+        elif serialized_batch is not None:
+            self.batch = deserialize_tensordict(serialized_batch)
+        else:
+            self.batch = None
 
         self.non_tensor_batch = non_tensor_batch
         self.meta_info = meta_info
